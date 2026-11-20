@@ -16,9 +16,14 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/migration.py 语义槽位迁移批次/交换数据/入库回执接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/slot_codec.py       v1 字典字符串 <-> v2 交换文档编解码
+│   ├── app/services/slot_migration.py   迁移流水线（批次、暂停/恢复、入库、回滚）
 │   ├── app/services/base.py     共享服务骨架
-│   └── app/store.py          内存数据仓库与示例数据
+│   ├── app/store.py          内存数据仓库与示例数据
+│   ├── scripts/slot_migration.py 离线迁移 CLI（不起服务即可演练）
+│   └── tests/                离线回归测试
 ├── .gitignore
 └── docker-compose.yml
 ```
@@ -63,11 +68,16 @@ npm run dev
 | 探针选择 | `probe_selector` | 探针配置 | 探针名称、目标页面、选择器列表 |
 | 页面快照 | `page_snapshot` | 快照记录 | 快照ID、页面URI、DOM哈希 |
 | 抽取指标 | `extract_metric` | 指标记录 | 记录时间、所属任务、成功页面数 |
-| 语义结果 | `nlu_result` | 语义记录 | 记录ID、输入文本、意图标签 |
+| 语义结果 | `nlu_result` | 语义记录 | 记录ID、输入文本、意图标签、槽位状态 |
 | 知识链接 | `knowledge_link` | 链接记录 | 链接ID、源实体、外部URI |
 | 输出目标 | `output_target` | 输出配置 | 配置名称、输出类型、目标地址 |
 | 抽取工坊 | `extract_studio` | 交互任务 | 任务名称、示例页面、标注区域 |
 | 聚合视图 | `aggregate_view` | 视图配置 | 视图名称、统计维度、聚合字段 |
+
+语义结果的槽位另有带版本交换结构：`槽位列表` 保留可读展示（迁移前是 v1
+Python 字典字符串，迁移后改成可读的 `slot=value` 摘要），`结构化槽位` /
+`槽位交换ID` / `槽位状态` / `槽位出处` / `原槽位列表` 记录 v2 交换数据的位置、
+状态与原始值。情感标注通过 `片段出处` 为槽位提供出处。
 
 ## 约定
 
@@ -76,6 +86,73 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 语义槽位迁移
+
+历史语义结果的槽位是 Python 字典字符串（v1），外部读取端无法稳定解析。迁移把
+它们写成带版本的交换文档（`schema=nlu.slot-exchange`, `schema_version=2`），
+记录原值、转换版本、完整性校验，以及每个槽位引用的情感片段出处。
+
+v2 交换文档的槽位形态：
+
+```json
+{"slot_type": "order_id", "value": "A-1024", "value_type": "str",
+ "provenance": {"type": "sentiment_snippet", "sentiment_record_id": "sent-1002",
+                "snippet": "订单 A-1024 的退款什么时候到账？", "snippet_sha256": "…"}}
+```
+
+状态与语义入库：
+
+| 状态 | 含义 | 语义入库 |
+| --- | --- | --- |
+| 已结构化 `already_structured` | 原本就是 v2 结构 | 核对后接纳 |
+| 已转换 `converted` | v1 无损转 v2 | 核对后接纳 |
+| 待补正 `needs_review` | 有损转换或来源未核对 | 拒绝，保留原值 |
+| 不可转换 `unconvertible` | 语法层面无法还原 | 拒绝，保留原值 |
+
+- 交换ID由「语义身份 + 情感来源 + 原值哈希」确定，迁移中断后重试不会重复。
+- 同一批次回滚会把语义行和情感交接清单还原到批次开始前，入库回执标记为已撤销；
+  交换文档与原值保留在批次历史里，可继续核对。
+- 已入库的历史记录（`status=已入库`）不会被再次接纳。
+
+### 离线演练（部署新版读取端之前）
+
+```bash
+# 全流程演练：迁移 3 条 -> 暂停 -> 恢复 -> 迁移剩余 -> 入库 -> 重试 -> 回滚
+backend/.venv/bin/python -I backend/scripts/slot_migration.py rehearse --out /tmp/rehearsal.json
+
+# 分步演练，状态在文件之间续跑
+backend/.venv/bin/python -I backend/scripts/slot_migration.py snapshot --limit 2 --out /tmp/m1.json
+backend/.venv/bin/python -I backend/scripts/slot_migration.py action pause  --state /tmp/m1.json --out /tmp/m2.json
+backend/.venv/bin/python -I backend/scripts/slot_migration.py action resume --state /tmp/m2.json --out /tmp/m3.json
+backend/.venv/bin/python -I backend/scripts/slot_migration.py migrate --state /tmp/m3.json --out /tmp/m4.json
+backend/.venv/bin/python -I backend/scripts/slot_migration.py ingest --run-id dry-run-1 --state /tmp/m4.json
+backend/.venv/bin/python -I backend/scripts/slot_migration.py legacy --semantic-id nlu-2001 --state /tmp/m4.json
+backend/.venv/bin/python -I backend/scripts/slot_migration.py action rollback --state /tmp/m4.json
+```
+
+离线脚本不碰在线内存仓库，`--state` 文件可以随演练交接。回归测试：
+
+```bash
+backend/.venv/bin/python -I -m unittest discover -s backend/tests -v
+```
+
+### 在线接口
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/nlu-slot-migration/batch` | 开启新批次 |
+| `POST /api/nlu-slot-migration/migrate` | 迁移（可 `limit` 分批） |
+| `POST /api/nlu-slot-migration/action` | `开始迁移/暂停/恢复/回滚/重置` |
+| `POST /api/nlu-slot-migration/ingest` | 执行一次语义入库，返回接纳/跳过回执 |
+| `GET /api/nlu-slot-migration/ingest/runs` | 每次入库接纳了哪些槽位、用了哪版输入 |
+| `GET /api/nlu-slot-migration/manifest` | 标注交接清单，按来源列出已转换与待补正 |
+| `GET /api/nlu-slot-migration/exchanges` | 按状态/来源/版本核对交换数据 |
+| `GET /api/nlu-slot-migration/exchanges/{id}/legacy` | 按旧版本读取已核对原值 |
+| `GET /api/nlu-slot-migration/legacy/nlu/{id}` | 旧读取端按语义记录ID回读原值 |
+
+前端工作台：`http://127.0.0.1:5173/slot-migration`，提供开始/暂停/恢复/回滚、
+分步迁移、语义入库、交接清单、交换数据核对和旧版回读。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

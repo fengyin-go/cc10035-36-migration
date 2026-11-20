@@ -21,7 +21,8 @@ class SentimentTagService(BaseModuleService):
     MODULE = "sentiment_tag"
     ENTITY = "情感记录"
     OPERATION_TERM = "校验"
-    LIST_FIELDS = ["记录ID", "文本片段", "情感倾向", "强烈程度", "方面词", "方面情感", "标注模型"]
+    LIST_FIELDS = ["记录ID", "文本片段", "片段出处", "情感倾向", "强烈程度", "方面词", "方面情感",
+                   "标注模型", "槽位核对状态"]
     REQUIRED_FIELDS = ["记录ID", "文本片段", "情感倾向"]
     STATUS_ORDER = ["已标注", "已复核", "已修正", "已忽略"]
     ACTION_RULES = {"复核标注": "已标注", "修正标注": "已标注", "忽略标注": "已标注"}
@@ -44,16 +45,19 @@ class SentimentTagService(BaseModuleService):
         aspect_idx = text_hash % len(aspects)
         aspect = aspects[aspect_idx]
         aspect_sent = ASPECT_SENTIMENTS[aspect][text_hash % 3]
+        snippet_source = f"{block.get('来源页面', '')}#{text_segment_block_id}"
 
         return {
             "ok": True,
             "记录ID": f"sent-{text_segment_block_id}",
             "文本片段": f"Text from block {text_segment_block_id}",
+            "片段出处": snippet_source,
             "情感倾向": sentiment,
             "强烈程度": intensity,
             "方面词": aspect,
             "方面情感": aspect_sent,
             "标注模型": "sentiment-analyzer-v2",
+            "槽位核对状态": "未核对",
         }
 
     def batch_analyze(self, text_block_ids: list[str]) -> dict[str, Any]:
